@@ -120,13 +120,60 @@ app.post('/', async (req, res) => {
   try {
     const body = req.body || {};
     if (body.action === 'verifyAccess') return res.json(await handleVerifyAccess(body));
+    if (body.action === 'getGradingData') return res.json(await handleGetGradingData(body));
     if (body.action === 'run') return res.json(await handleRun(body)); // fallback path only
-    if (body.action === 'submit') return res.json(await handleSubmit(body));
+    if (body.action === 'submit') return res.json(await handleSubmit(body)); // slow, authoritative server-side recompute (fallback)
+    if (body.action === 'submitLocal') return res.json(await handleSubmitLocal(body)); // fast path: trusts client-computed score
     return res.json({ error: 'unknown action' });
   } catch (err) {
     res.json({ error: err.message });
   }
 });
+
+// Fast path support: hand the full answer key (including hidden test cases)
+// to the browser so the student's own JDK can grade it. This is faster but
+// means hidden test cases are no longer secret from a technically inclined
+// student at submit time — a deliberate trade-off requested for speed.
+async function handleGetGradingData(body) {
+  const test = await getTestAnswers(body.testId);
+  return {
+    marksConfig: test.marksConfig || { mcqEach: 1, codingEach: 5 },
+    mcqAnswers: test.mcqAnswers,
+    codingTests: test.codingTests
+  };
+}
+
+// Fast path: store whatever score the client (local JDK) computed, with
+// basic sanity clamping. No server-side recompilation — this is the whole
+// point of the fast path. Use action "submit" instead for the slower,
+// independently-verified version.
+async function handleSubmitLocal(body) {
+  const test = await getTestAnswers(body.testId);
+  const marks = test.marksConfig || { mcqEach: 1, codingEach: 5 };
+  const roll = String(body.rollNumber || '').trim();
+  const name = String(body.name || '').trim();
+  if (!roll || !name) return { error: 'missing roll number or name' };
+
+  const maxScore = (Object.keys(test.mcqAnswers).length * marks.mcqEach) +
+                    (Object.keys(test.codingTests).length * marks.codingEach);
+  const clamp = (v, max) => Math.max(0, Math.min(Number(v) || 0, max));
+  const mcqMax = Object.keys(test.mcqAnswers).length * marks.mcqEach;
+  const codingMax = Object.keys(test.codingTests).length * marks.codingEach;
+  const mcqScore = clamp(body.mcqScore, mcqMax);
+  const codingScore = clamp(body.codingScore, codingMax);
+  const totalScore = mcqScore + codingScore;
+
+  const record = {
+    testId: body.testId, rollNumber: roll, name, submittedAt: new Date().toISOString(),
+    gradedBy: 'client-local-jdk',
+    mcqScore, codingScore, totalScore, maxScore,
+    mcqDetail: body.mcqDetail || {}, codingDetail: body.codingDetail || {},
+    integrity: body.integrity || {}
+  };
+
+  const pushResult = await pushResultToGitHub(body.testId, roll, record);
+  return { ok: true, totalScore, maxScore, mcqScore, codingScore, saved: pushResult.ok, saveError: pushResult.error || null };
+}
 
 async function handleVerifyAccess(body) {
   const test = await getTestAnswers(body.testId);
@@ -182,6 +229,7 @@ async function handleSubmit(body) {
 
   const record = {
     testId: body.testId, rollNumber: roll, name, submittedAt: new Date().toISOString(),
+    gradedBy: 'server-recompute',
     mcqScore, codingScore, totalScore, maxScore, mcqDetail, codingDetail,
     integrity: body.integrity || {}
   };
