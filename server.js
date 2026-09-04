@@ -58,18 +58,24 @@ function runWithLimit(fn) {
 }
 function cleanup(dir) { fs.rm(dir, { recursive: true, force: true }, () => {}); }
 
+function detectClassName(code) {
+  const m = code.match(/public\s+class\s+(\w+)/);
+  return m ? m[1] : 'Main';
+}
+
 function runJavaOnce(code, stdin) {
   return runWithLimit(() => new Promise((resolve) => {
     let dir;
+    const className = detectClassName(code);
     try {
       dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jt-'));
-      fs.writeFileSync(path.join(dir, 'Main.java'), code, 'utf-8');
+      fs.writeFileSync(path.join(dir, className + '.java'), code, 'utf-8');
     } catch (e) { return resolve({ error: 'Server error preparing sandbox: ' + e.message }); }
 
-    execFile('javac', ['Main.java'], { cwd: dir, timeout: 10000 }, (compErr, _out, compStderr) => {
+    execFile('javac', [className + '.java'], { cwd: dir, timeout: 10000 }, (compErr, _out, compStderr) => {
       if (compErr) { cleanup(dir); return resolve({ error: 'Compile error:\n' + (compStderr || compErr.message) }); }
       let finished = false;
-      const child = spawn('java', ['-Xmx128m', '-cp', dir, 'Main'], { cwd: dir });
+      const child = spawn('java', ['-Xmx128m', '-cp', dir, className], { cwd: dir });
       let stdout = '', stderr = '';
       const timer = setTimeout(() => {
         if (!finished) { finished = true; child.kill(); cleanup(dir); resolve({ error: 'Time limit exceeded (5s)' }); }
@@ -121,6 +127,7 @@ app.post('/', async (req, res) => {
     const body = req.body || {};
     if (body.action === 'verifyAccess') return res.json(await handleVerifyAccess(body));
     if (body.action === 'getGradingData') return res.json(await handleGetGradingData(body));
+    if (body.action === 'checkSubmitted') return res.json(await handleCheckSubmitted(body));
     if (body.action === 'run') return res.json(await handleRun(body)); // fallback path only
     if (body.action === 'submit') return res.json(await handleSubmit(body)); // slow, authoritative server-side recompute (fallback)
     if (body.action === 'submitLocal') return res.json(await handleSubmitLocal(body)); // fast path: trusts client-computed score
@@ -129,6 +136,23 @@ app.post('/', async (req, res) => {
     res.json({ error: err.message });
   }
 });
+
+// Server-authoritative "already submitted?" check — this is what actually
+// gates re-entry, not the student's own browser storage. To grant a
+// reattempt, delete that student's result file (see results.html's
+// "Allow Reattempt" button) and this check will pass again.
+async function handleCheckSubmitted(body) {
+  const roll = String(body.rollNumber || '').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+  const filePath = 'results/' + body.testId + '/' + roll + '.json';
+  const apiUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`;
+  const resp = await fetch(apiUrl, { headers: { Authorization: 'token ' + GITHUB_TOKEN } });
+  if (resp.status === 404) return { submitted: false };
+  if (!resp.ok) return { submitted: false, checkError: 'status ' + resp.status };
+  const meta = await resp.json();
+  const decoded = Buffer.from(meta.content, 'base64').toString('utf-8');
+  const record = JSON.parse(decoded);
+  return { submitted: true, record };
+}
 
 // Fast path support: hand the full answer key (including hidden test cases)
 // to the browser so the student's own JDK can grade it. This is faster but
@@ -147,6 +171,31 @@ async function handleGetGradingData(body) {
 // basic sanity clamping. No server-side recompilation — this is the whole
 // point of the fast path. Use action "submit" instead for the slower,
 // independently-verified version.
+// Builds a student-safe breakdown: which questions scored what, and WHY,
+// without ever exposing the actual hidden test inputs/outputs.
+function buildBreakdown(test, codingDetail) {
+  const breakdown = [];
+  const codingEach = (test.marksConfig || {}).codingEach || 5;
+  for (const cid in test.codingTests) {
+    const tests = test.codingTests[cid];
+    const detail = codingDetail[cid];
+    if (!detail || !detail.results || !detail.results.length) {
+      breakdown.push({ id: cid, awarded: 0, max: codingEach, message: 'Not attempted or no output produced' });
+      continue;
+    }
+    const results = detail.results;
+    const allPassed = results.every(r => r.pass);
+    const visibleIdx = tests.map((t, i) => (t.visible ? i : -1)).filter(i => i >= 0);
+    const visiblePassed = visibleIdx.length > 0 && visibleIdx.every(i => results[i] && results[i].pass);
+    let message;
+    if (allPassed) message = 'Passed all tests';
+    else if (visiblePassed) message = 'Sample tests passed, but hidden tests failed — your solution likely does not handle cases beyond the examples shown';
+    else message = 'Some sample tests failed — review your code';
+    breakdown.push({ id: cid, awarded: detail.awarded || 0, max: codingEach, message });
+  }
+  return breakdown;
+}
+
 async function handleSubmitLocal(body) {
   const test = await getTestAnswers(body.testId);
   const marks = test.marksConfig || { mcqEach: 1, codingEach: 5 };
@@ -172,7 +221,8 @@ async function handleSubmitLocal(body) {
   };
 
   const pushResult = await pushResultToGitHub(body.testId, roll, record);
-  return { ok: true, totalScore, maxScore, mcqScore, codingScore, saved: pushResult.ok, saveError: pushResult.error || null };
+  const breakdown = buildBreakdown(test, record.codingDetail);
+  return { ok: true, totalScore, maxScore, mcqScore, codingScore, breakdown, saved: pushResult.ok, saveError: pushResult.error || null };
 }
 
 async function handleVerifyAccess(body) {
@@ -235,9 +285,10 @@ async function handleSubmit(body) {
   };
 
   const pushResult = await pushResultToGitHub(body.testId, roll, record);
+  const breakdown = buildBreakdown(test, codingDetail);
 
   return {
-    ok: true, totalScore, maxScore, mcqScore, codingScore,
+    ok: true, totalScore, maxScore, mcqScore, codingScore, breakdown,
     saved: pushResult.ok, saveError: pushResult.error || null
   };
 }
