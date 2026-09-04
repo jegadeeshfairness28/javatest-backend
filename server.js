@@ -58,24 +58,36 @@ function runWithLimit(fn) {
 }
 function cleanup(dir) { fs.rm(dir, { recursive: true, force: true }, () => {}); }
 
-function detectClassName(code) {
-  const m = code.match(/public\s+class\s+(\w+)/);
-  return m ? m[1] : 'Main';
+function detectClassInfo(code) {
+  const pm = code.match(/public\s+(?:final\s+|abstract\s+)?class\s+(\w+)/);
+  if (pm) return { compileFileName: pm[1], runClass: pm[1] };
+
+  const classRe = /class\s+(\w+)/g;
+  const names = [], starts = [];
+  let m;
+  while ((m = classRe.exec(code)) !== null) { names.push(m[1]); starts.push(m.index); }
+  for (let i = 0; i < names.length; i++) {
+    const start = starts[i];
+    const end = i + 1 < starts.length ? starts[i + 1] : code.length;
+    const segment = code.slice(start, end);
+    if (/static\s+void\s+main/.test(segment)) return { compileFileName: 'Submission', runClass: names[i] };
+  }
+  return { compileFileName: 'Main', runClass: 'Main' };
 }
 
 function runJavaOnce(code, stdin) {
   return runWithLimit(() => new Promise((resolve) => {
     let dir;
-    const className = detectClassName(code);
+    const { compileFileName, runClass } = detectClassInfo(code);
     try {
       dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jt-'));
-      fs.writeFileSync(path.join(dir, className + '.java'), code, 'utf-8');
+      fs.writeFileSync(path.join(dir, compileFileName + '.java'), code, 'utf-8');
     } catch (e) { return resolve({ error: 'Server error preparing sandbox: ' + e.message }); }
 
-    execFile('javac', [className + '.java'], { cwd: dir, timeout: 10000 }, (compErr, _out, compStderr) => {
+    execFile('javac', [compileFileName + '.java'], { cwd: dir, timeout: 10000 }, (compErr, _out, compStderr) => {
       if (compErr) { cleanup(dir); return resolve({ error: 'Compile error:\n' + (compStderr || compErr.message) }); }
       let finished = false;
-      const child = spawn('java', ['-Xmx128m', '-cp', dir, className], { cwd: dir });
+      const child = spawn('java', ['-Xmx128m', '-cp', dir, runClass], { cwd: dir });
       let stdout = '', stderr = '';
       const timer = setTimeout(() => {
         if (!finished) { finished = true; child.kill(); cleanup(dir); resolve({ error: 'Time limit exceeded (5s)' }); }
