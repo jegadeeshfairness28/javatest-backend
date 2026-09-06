@@ -77,7 +77,34 @@ function detectClassInfo(code) {
 
 function runCodeOnce(language, code, stdin) {
   if (language === 'c' || language === 'cpp') return runCOnce(language, code, stdin);
+  if (language === 'python') return runPythonOnce(code, stdin);
   return runJavaOnce(code, stdin);
+}
+
+function runPythonOnce(code, stdin) {
+  return runWithLimit(() => new Promise((resolve) => {
+    let dir;
+    try {
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jt-'));
+      fs.writeFileSync(path.join(dir, 'submission.py'), code, 'utf-8');
+    } catch (e) { return resolve({ error: 'Server error preparing sandbox: ' + e.message }); }
+
+    let finished = false;
+    const child = spawn('python3', ['submission.py'], { cwd: dir });
+    let stdout = '', stderr = '';
+    const timer = setTimeout(() => {
+      if (!finished) { finished = true; child.kill(); cleanup(dir); resolve({ error: 'Time limit exceeded (5s)' }); }
+    }, 5000);
+    child.stdout.on('data', d => stdout += d.toString());
+    child.stderr.on('data', d => stderr += d.toString());
+    child.on('close', (codeVal) => {
+      if (finished) return; finished = true; clearTimeout(timer); cleanup(dir);
+      if (codeVal !== 0 && stderr) return resolve({ error: 'Runtime error:\n' + stderr });
+      resolve({ stdout, stderr });
+    });
+    child.on('error', (e) => { if (finished) return; finished = true; clearTimeout(timer); cleanup(dir); resolve({ error: 'Could not run python3: ' + e.message }); });
+    try { child.stdin.write(stdin || ''); child.stdin.end(); } catch (e) {}
+  }));
 }
 
 function runCOnce(language, code, stdin) {
@@ -207,53 +234,74 @@ async function handleCheckSubmitted(body) {
 async function handleGetGradingData(body) {
   const test = await getTestAnswers(body.testId);
   return {
-    marksConfig: test.marksConfig || { mcqEach: 1, codingEach: 5 },
+    marksConfig: test.marksConfig || { mcqEach: 1 },
     mcqAnswers: test.mcqAnswers,
-    codingTests: test.codingTests
+    codingSections: test.codingSections || {}
   };
 }
 
-// Fast path: store whatever score the client (local JDK) computed, with
-// basic sanity clamping. No server-side recompilation — this is the whole
-// point of the fast path. Use action "submit" instead for the slower,
-// independently-verified version.
-// Builds a student-safe breakdown: which questions scored what, and WHY,
-// without ever exposing the actual hidden test inputs/outputs.
-function buildBreakdown(test, codingDetail) {
-  const breakdown = [];
-  const codingEach = (test.marksConfig || {}).codingEach || 5;
-  for (const cid in test.codingTests) {
-    const tests = test.codingTests[cid];
-    const detail = codingDetail[cid];
-    if (!detail || !detail.results || !detail.results.length) {
-      breakdown.push({ id: cid, awarded: 0, max: codingEach, message: 'Not attempted or no output produced' });
-      continue;
+// Flattens codingSections into { qid: { tests, marksPerQuestion, sectionId } }
+// for grading — keeps the per-section marks logic in one place.
+function flattenSections(codingSections) {
+  const flat = {};
+  for (const sid in codingSections) {
+    const section = codingSections[sid];
+    for (const qid in section.questions) {
+      flat[qid] = { tests: section.questions[qid], marksPerQuestion: section.marksPerQuestion, sectionId: sid };
     }
-    const results = detail.results;
-    const allPassed = results.every(r => r.pass);
-    const visibleIdx = tests.map((t, i) => (t.visible ? i : -1)).filter(i => i >= 0);
-    const visiblePassed = visibleIdx.length > 0 && visibleIdx.every(i => results[i] && results[i].pass);
-    let message;
-    if (allPassed) message = 'Passed all tests';
-    else if (visiblePassed) message = 'Sample tests passed, but hidden tests failed — your solution likely does not handle cases beyond the examples shown';
-    else message = 'Some sample tests failed — review your code';
-    breakdown.push({ id: cid, awarded: detail.awarded || 0, max: codingEach, message });
   }
-  return breakdown;
+  return flat;
+}
+
+// Builds a student-safe breakdown: which questions scored what, and WHY,
+// without ever exposing the actual hidden test inputs/outputs. Also returns
+// per-section totals for the results table.
+function buildBreakdown(test, codingDetail) {
+  const flat = flattenSections(test.codingSections || {});
+  const breakdown = [];
+  const sectionTotals = {}; // sid -> { name, obtained, max }
+
+  for (const sid in (test.codingSections || {})) {
+    sectionTotals[sid] = { name: test.codingSections[sid].name || sid, obtained: 0, max: 0 };
+  }
+
+  for (const qid in flat) {
+    const { tests, marksPerQuestion, sectionId } = flat[qid];
+    const detail = codingDetail[qid];
+    let awarded = 0, message;
+    if (!detail || !detail.results || !detail.results.length) {
+      message = 'Not attempted or no output produced';
+    } else {
+      const results = detail.results;
+      const allPassed = results.every(r => r.pass);
+      const visibleIdx = tests.map((t, i) => (t.visible ? i : -1)).filter(i => i >= 0);
+      const visiblePassed = visibleIdx.length > 0 && visibleIdx.every(i => results[i] && results[i].pass);
+      awarded = detail.awarded || 0;
+      if (allPassed) message = 'Passed all tests';
+      else if (visiblePassed) message = 'Sample tests passed, but hidden tests failed — your solution likely does not handle cases beyond the examples shown';
+      else message = 'Some sample tests failed — review your code';
+    }
+    breakdown.push({ id: qid, sectionId, awarded, max: marksPerQuestion, message });
+    if (sectionTotals[sectionId]) {
+      sectionTotals[sectionId].obtained += awarded;
+      sectionTotals[sectionId].max += marksPerQuestion;
+    }
+  }
+  return { breakdown, sectionTotals };
 }
 
 async function handleSubmitLocal(body) {
   const test = await getTestAnswers(body.testId);
-  const marks = test.marksConfig || { mcqEach: 1, codingEach: 5 };
+  const marks = test.marksConfig || { mcqEach: 1 };
   const roll = String(body.rollNumber || '').trim();
   const name = String(body.name || '').trim();
   if (!roll || !name) return { error: 'missing roll number or name' };
 
-  const maxScore = (Object.keys(test.mcqAnswers).length * marks.mcqEach) +
-                    (Object.keys(test.codingTests).length * marks.codingEach);
-  const clamp = (v, max) => Math.max(0, Math.min(Number(v) || 0, max));
+  const flat = flattenSections(test.codingSections || {});
   const mcqMax = Object.keys(test.mcqAnswers).length * marks.mcqEach;
-  const codingMax = Object.keys(test.codingTests).length * marks.codingEach;
+  const codingMax = Object.values(flat).reduce((s, f) => s + f.marksPerQuestion, 0);
+  const maxScore = mcqMax + codingMax;
+  const clamp = (v, max) => Math.max(0, Math.min(Number(v) || 0, max));
   const mcqScore = clamp(body.mcqScore, mcqMax);
   const codingScore = clamp(body.codingScore, codingMax);
   const totalScore = mcqScore + codingScore;
@@ -267,8 +315,8 @@ async function handleSubmitLocal(body) {
   };
 
   const pushResult = await pushResultToGitHub(body.testId, roll, record);
-  const breakdown = buildBreakdown(test, record.codingDetail);
-  return { ok: true, totalScore, maxScore, mcqScore, codingScore, breakdown, saved: pushResult.ok, saveError: pushResult.error || null };
+  const { breakdown, sectionTotals } = buildBreakdown(test, record.codingDetail);
+  return { ok: true, totalScore, maxScore, mcqScore, codingScore, breakdown, sectionTotals, saved: pushResult.ok, saveError: pushResult.error || null };
 }
 
 async function handleVerifyAccess(body) {
@@ -280,21 +328,23 @@ async function handleVerifyAccess(body) {
 // the frontend chooses to fall back here — not used for scoring).
 async function handleRun(body) {
   const test = await getTestAnswers(body.testId);
-  const tests = test.codingTests[body.questionId];
-  if (!tests) return { error: 'invalid question id' };
-  const visibleOnly = tests.filter(t => t.visible);
-  return { results: await runCodeAgainstTests(body.language || 'java', body.code, visibleOnly.length ? visibleOnly : tests) };
+  const flat = flattenSections(test.codingSections || {});
+  const entry = flat[body.questionId];
+  if (!entry) return { error: 'invalid question id' };
+  const visibleOnly = entry.tests.filter(t => t.visible);
+  return { results: await runCodeAgainstTests(body.language || 'java', body.code, visibleOnly.length ? visibleOnly : entry.tests) };
 }
 
 async function handleSubmit(body) {
   const test = await getTestAnswers(body.testId);
-  const marks = test.marksConfig || { mcqEach: 1, codingEach: 5 };
+  const marks = test.marksConfig || { mcqEach: 1 };
   const roll = String(body.rollNumber || '').trim();
   const name = String(body.name || '').trim();
   if (!roll || !name) return { error: 'missing roll number or name' };
 
   const mcqAnswers = body.mcqAnswers || {};
   const codingCode = body.codingCode || {};
+  const flat = flattenSections(test.codingSections || {});
 
   let mcqScore = 0;
   const mcqDetail = {};
@@ -308,20 +358,22 @@ async function handleSubmit(body) {
 
   let codingScore = 0;
   const codingDetail = {};
-  for (const cid in test.codingTests) {
-    const code = codingCode[cid] || '';
-    const tests = test.codingTests[cid]; // ALL test cases (visible + hidden) count for grading
+  for (const qid in flat) {
+    const { tests, marksPerQuestion } = flat[qid];
+    const code = codingCode[qid] || '';
     const results = code.trim()
       ? await runCodeAgainstTests(body.language || 'java', code, tests)
       : tests.map(() => ({ pass: false, error: 'no code submitted' }));
     const allPass = results.every(r => r.pass);
-    if (allPass) codingScore += marks.codingEach;
-    codingDetail[cid] = { code, results, awarded: allPass ? marks.codingEach : 0 };
+    const awarded = allPass ? marksPerQuestion : 0;
+    codingScore += awarded;
+    codingDetail[qid] = { code, results, awarded };
   }
 
+  const mcqMax = Object.keys(test.mcqAnswers).length * marks.mcqEach;
+  const codingMax = Object.values(flat).reduce((s, f) => s + f.marksPerQuestion, 0);
   const totalScore = mcqScore + codingScore;
-  const maxScore = (Object.keys(test.mcqAnswers).length * marks.mcqEach) +
-                   (Object.keys(test.codingTests).length * marks.codingEach);
+  const maxScore = mcqMax + codingMax;
 
   const record = {
     testId: body.testId, rollNumber: roll, name, submittedAt: new Date().toISOString(),
@@ -331,10 +383,10 @@ async function handleSubmit(body) {
   };
 
   const pushResult = await pushResultToGitHub(body.testId, roll, record);
-  const breakdown = buildBreakdown(test, codingDetail);
+  const { breakdown, sectionTotals } = buildBreakdown(test, codingDetail);
 
   return {
-    ok: true, totalScore, maxScore, mcqScore, codingScore, breakdown,
+    ok: true, totalScore, maxScore, mcqScore, codingScore, breakdown, sectionTotals,
     saved: pushResult.ok, saveError: pushResult.error || null
   };
 }
