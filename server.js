@@ -75,6 +75,40 @@ function detectClassInfo(code) {
   return { compileFileName: 'Main', runClass: 'Main' };
 }
 
+function runCodeOnce(language, code, stdin) {
+  if (language === 'c' || language === 'cpp') return runCOnce(language, code, stdin);
+  return runJavaOnce(code, stdin);
+}
+
+function runCOnce(language, code, stdin) {
+  return runWithLimit(() => new Promise((resolve) => {
+    let dir;
+    const ext = language === 'cpp' ? '.cpp' : '.c';
+    const compiler = language === 'cpp' ? 'g++' : 'gcc';
+    const srcName = 'submission' + ext;
+    const outName = 'submission';
+    try {
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jt-'));
+      fs.writeFileSync(path.join(dir, srcName), code, 'utf-8');
+    } catch (e) { return resolve({ error: 'Server error preparing sandbox: ' + e.message }); }
+
+    execFile(compiler, [srcName, '-o', outName], { cwd: dir, timeout: 10000 }, (compErr, _out, compStderr) => {
+      if (compErr) { cleanup(dir); return resolve({ error: 'Compile error:\n' + (compStderr || compErr.message) }); }
+      let finished = false;
+      const child = spawn(path.join(dir, outName), [], { cwd: dir });
+      let stdout = '', stderr = '';
+      const timer = setTimeout(() => {
+        if (!finished) { finished = true; child.kill(); cleanup(dir); resolve({ error: 'Time limit exceeded (5s)' }); }
+      }, 5000);
+      child.stdout.on('data', d => stdout += d.toString());
+      child.stderr.on('data', d => stderr += d.toString());
+      child.on('close', () => { if (finished) return; finished = true; clearTimeout(timer); cleanup(dir); resolve({ stdout, stderr }); });
+      child.on('error', (e) => { if (finished) return; finished = true; clearTimeout(timer); cleanup(dir); resolve({ error: 'Could not run program: ' + e.message }); });
+      try { child.stdin.write(stdin || ''); child.stdin.end(); } catch (e) {}
+    });
+  }));
+}
+
 function runJavaOnce(code, stdin) {
   return runWithLimit(() => new Promise((resolve) => {
     let dir;
@@ -101,10 +135,10 @@ function runJavaOnce(code, stdin) {
   }));
 }
 
-async function runCodeAgainstTests(code, tests) {
+async function runCodeAgainstTests(language, code, tests) {
   const results = [];
   for (const t of tests) {
-    const run = await runJavaOnce(code, t.input);
+    const run = await runCodeOnce(language, code, t.input);
     if (run.error) { results.push({ pass: false, error: run.error }); continue; }
     const actual = (run.stdout || '').replace(/\s+$/, '');
     const expected = (t.expectedOutput || '').replace(/\s+$/, '');
@@ -249,7 +283,7 @@ async function handleRun(body) {
   const tests = test.codingTests[body.questionId];
   if (!tests) return { error: 'invalid question id' };
   const visibleOnly = tests.filter(t => t.visible);
-  return { results: await runCodeAgainstTests(body.code, visibleOnly.length ? visibleOnly : tests) };
+  return { results: await runCodeAgainstTests(body.language || 'java', body.code, visibleOnly.length ? visibleOnly : tests) };
 }
 
 async function handleSubmit(body) {
@@ -278,7 +312,7 @@ async function handleSubmit(body) {
     const code = codingCode[cid] || '';
     const tests = test.codingTests[cid]; // ALL test cases (visible + hidden) count for grading
     const results = code.trim()
-      ? await runCodeAgainstTests(code, tests)
+      ? await runCodeAgainstTests(body.language || 'java', code, tests)
       : tests.map(() => ({ pass: false, error: 'no code submitted' }));
     const allPass = results.every(r => r.pass);
     if (allPass) codingScore += marks.codingEach;
