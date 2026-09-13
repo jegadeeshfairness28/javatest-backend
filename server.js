@@ -173,11 +173,18 @@ async function handleSubmitLocal(body) {
   const name = String(body.name || '').trim();
   if (!roll || !name) return { error: 'missing roll number or name' };
 
+  const codingDetail = body.codingDetail || {};
   const mcqMax = Object.keys(test.mcqAnswers).length * marks.mcqEach;
   let codingMax = 0;
+  const sectionTotals = {}; // sid -> { obtained, max } — names filled in client-side from TEST.codingSections
   for (const sid in (test.codingSections || {})) {
     const sec = test.codingSections[sid];
-    codingMax += Object.keys(sec.questions || {}).length * sec.marksPerQuestion;
+    const qids = Object.keys(sec.questions || {});
+    const secMax = qids.length * sec.marksPerQuestion;
+    codingMax += secMax;
+    let obtained = 0;
+    qids.forEach(qid => { if (codingDetail[qid]) obtained += codingDetail[qid].awarded || 0; });
+    sectionTotals[sid] = { obtained, max: secMax };
   }
   const maxScore = mcqMax + codingMax;
   const clamp = (v, max) => Math.max(0, Math.min(Number(v) || 0, max));
@@ -194,15 +201,15 @@ async function handleSubmitLocal(body) {
     testId: body.testId, rollNumber: roll, name,
     startedAt, submittedAt, durationMinutes,
     gradedBy: 'client-local-jdk',
-    mcqScore, codingScore, totalScore, maxScore,
-    mcqDetail: body.mcqDetail || {}, codingDetail: body.codingDetail || {},
+    mcqScore, codingScore, totalScore, maxScore, mcqMax, codingMax, sectionTotals,
+    mcqDetail: body.mcqDetail || {}, codingDetail,
     integrity: body.integrity || {}
   };
 
   const existingResult = await ghGetJson(resultPath(body.testId, roll));
   await ghPutJson(resultPath(body.testId, roll), record, existingResult ? existingResult.sha : null, 'submission: ' + roll);
 
-  return { ok: true, totalScore, maxScore, mcqScore, codingScore, saved: true };
+  return { ok: true, totalScore, maxScore, mcqScore, codingScore, mcqMax, codingMax, sectionTotals, saved: true };
 }
 
 app.listen(PORT, () => console.log('Java test backend running on port ' + PORT));
