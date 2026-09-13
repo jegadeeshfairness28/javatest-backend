@@ -76,9 +76,54 @@ async function ghPutJson(path, obj, sha, message) {
   const content = Buffer.from(JSON.stringify(obj, null, 2)).toString('base64');
   const payload = { message: message || ('update ' + path), content };
   if (sha) payload.sha = sha;
-  const resp = await fetch(url, { method: 'PUT', headers: { Authorization: 'token ' + GITHUB_TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-  if (!resp.ok) throw new Error('GitHub PUT failed (' + resp.status + '): ' + await resp.text());
-  return (await resp.json()).content.sha;
+
+  const maxAttempts = 3;
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const resp = await fetch(url, { method: 'PUT', headers: { Authorization: 'token ' + GITHUB_TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    if (resp.ok) return (await resp.json()).content.sha;
+
+    const bodyText = await resp.text().catch(() => '');
+    lastErr = new Error('GitHub PUT failed (' + resp.status + '): ' + bodyText + ' [path=' + path + ', attempt ' + attempt + '/' + maxAttempts + ']');
+
+    // Only retry transient server-side errors — a 4xx (bad sha, payload
+    // too large, auth issue) fails identically every time, so retrying it
+    // would just delay the real error from reaching the student.
+    const isTransient = resp.status >= 500 && resp.status < 600;
+    if (!isTransient || attempt === maxAttempts) throw lastErr;
+    await new Promise(r => setTimeout(r, 500 * attempt)); // 500ms, then 1000ms
+  }
+  throw lastErr;
+}
+
+// GitHub's Contents API rejects file content over ~1MB. A results record
+// stores full source code plus every test's expected/actual output for
+// every coding question — on a test with several questions and many
+// (especially hidden) tests, that can realistically approach or cross that
+// limit, and GitHub tends to answer with a bare 500 rather than a clean
+// "too large" error. Capping each stored string keeps a single verbose
+// submission from ever pushing the file past the API's limit; this only
+// affects what's kept for later viewing/regrading, never the score itself
+// (which is already computed client-side and passed in before this runs).
+const MAX_STORED_STRING = 4000;
+function truncateForStorage(s) {
+  if (typeof s !== 'string' || s.length <= MAX_STORED_STRING) return s;
+  return s.slice(0, MAX_STORED_STRING) + '\n…[truncated for storage — ' + (s.length - MAX_STORED_STRING) + ' more chars]';
+}
+function shrinkCodingDetailForStorage(codingDetail) {
+  const shrunk = {};
+  for (const qid in (codingDetail || {})) {
+    const d = codingDetail[qid] || {};
+    shrunk[qid] = Object.assign({}, d, {
+      code: truncateForStorage(d.code),
+      results: (d.results || []).map(r => Object.assign({}, r, {
+        expected: truncateForStorage(r.expected),
+        actual: truncateForStorage(r.actual),
+        stderr: truncateForStorage(r.stderr)
+      }))
+    });
+  }
+  return shrunk;
 }
 
 function attemptPath(testId, roll) { return `attempts/${testId}/${safeRoll(roll)}.json`; }
@@ -202,7 +247,7 @@ async function handleSubmitLocal(body) {
     startedAt, submittedAt, durationMinutes,
     gradedBy: 'client-local-jdk',
     mcqScore, codingScore, totalScore, maxScore, mcqMax, codingMax, sectionTotals,
-    mcqDetail: body.mcqDetail || {}, codingDetail,
+    mcqDetail: body.mcqDetail || {}, codingDetail: shrinkCodingDetailForStorage(codingDetail),
     integrity: body.integrity || {}
   };
 
